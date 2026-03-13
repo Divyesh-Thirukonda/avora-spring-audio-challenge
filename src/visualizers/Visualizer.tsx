@@ -32,6 +32,8 @@ interface PacketData {
   progress: number
   speed: number
   hue: number
+  energy: number   // 0-1, the band energy that spawned this packet (weight/significance)
+  size: number     // visual radius, derived from energy
 }
 
 /* ─── Constants ─── */
@@ -230,14 +232,22 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
           // Deterministic check per connection
           const connHash = (timeHash * 43.1 + ci * 17.9) % 1
           if (packets.length < MAX_PACKETS && connHash < 0.35) {
-            // Speed derived from band energy — higher energy = faster packets
-            const speedVal = bandEnergy * 0.025 + (1 - bandEnergy) * 0.015
+            const energy = bandEnergy // packet's significance weight
+
+            // Speed weighted by energy: quiet=0.008, loud=0.035
+            const speedVal = 0.008 + energy * 0.027
+
+            // Size weighted by energy: quiet=0.08, loud=0.30
+            const sizeVal = 0.08 + energy * 0.22
+
             packets.push({
               fromNode: i,
               toNode: connIdx,
               progress: 0,
               speed: speedVal,
               hue: node.hue,
+              energy,
+              size: sizeVal,
             })
           }
         }
@@ -377,8 +387,11 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
 
         if (pkt.progress >= 1) {
           const dest = nodes[pkt.toNode]
-          dest.activation = Math.min(1, dest.activation + 0.15)
-          dest.pulseTime = Math.min(1, dest.pulseTime + 0.3)
+          // Impact on destination node is weighted by the packet's energy
+          const impactActivation = 0.05 + pkt.energy * 0.25  // 0.05 to 0.30
+          const impactPulse = 0.1 + pkt.energy * 0.5          // 0.1 to 0.6
+          dest.activation = Math.min(1, dest.activation + impactActivation)
+          dest.pulseTime = Math.min(1, dest.pulseTime + impactPulse)
           packets.splice(i, 1)
           continue
         }
@@ -391,15 +404,18 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
           from.position.y + (to.position.y - from.position.y) * t,
           from.position.z + (to.position.z - from.position.z) * t,
         )
-        _obj.scale.setScalar(0.15 + Math.sin(t * Math.PI) * 0.1)
+        // Size uses the energy-weighted base size with a sine bulge in the middle of travel
+        _obj.scale.setScalar(pkt.size + Math.sin(t * Math.PI) * pkt.size * 0.5)
         _obj.updateMatrix()
         packetMesh.setMatrixAt(activeCount, _obj.matrix)
 
-        // Packets — moderate brightness
-        _tmpColor.setHSL(pkt.hue / 360, 0.9, 0.7)
-        _tmpColor.r *= 1.2
-        _tmpColor.g *= 1.2
-        _tmpColor.b *= 1.2
+        // Packet brightness weighted by energy: dim packets for quiet, blazing for loud
+        const pktLightness = 0.45 + pkt.energy * 0.35            // 0.45 to 0.80
+        const pktMultiplier = 0.8 + pkt.energy * 1.2              // 0.8 to 2.0
+        _tmpColor.setHSL(pkt.hue / 360, 0.9, pktLightness)
+        _tmpColor.r *= pktMultiplier
+        _tmpColor.g *= pktMultiplier
+        _tmpColor.b *= pktMultiplier
         packetMesh.setColorAt(activeCount, _tmpColor)
 
         activeCount++
