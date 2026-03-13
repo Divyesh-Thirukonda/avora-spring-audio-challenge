@@ -205,8 +205,8 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
       }
       // Apply exponential frequency weighting: high frequencies naturally have
       // exponentially less amplitude than bass, so we need a massive boost for treble
-      // b=0 (bass) multiplier is 1.0; b=15 (highest treble) multiplier is ~26.0
-      const energyMultiplier = 1 + Math.pow(b / 3, 2)
+      // b=0 (bass) multiplier is 1.0; b=15 (highest treble) multiplier is ~57.0
+      const energyMultiplier = 1 + Math.pow(b / 2, 2)
       bandEnergies[b] = Math.min(1.0, (sum / (bandSize * 255)) * energyMultiplier)
     }
 
@@ -273,7 +273,7 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
     if (nodeMesh && glowMesh) {
       for (let i = 0; i < nodes.length; i++) {
         const node = nodes[i]
-        const size = node.baseSize * breathing * (1 + node.activation * 2.5 + node.pulseTime * 3)
+        const size = node.baseSize * breathing * (1 + node.activation * 1.5 + node.pulseTime * 1.2)
 
         // Core sphere
         _obj.position.copy(node.position)
@@ -282,11 +282,11 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
         nodeMesh.setMatrixAt(i, _obj.matrix)
 
         // Color: vibrant and bright via HDR
-        const L = 0.5 + node.activation * 0.4
+        const L = 0.5 + node.activation * 0.35
         _tmpColor.setHSL(node.hue / 360, 0.85, L)
-        _tmpColor.r *= 1.2 + node.activation * 1.3
-        _tmpColor.g *= 1.2 + node.activation * 1.3
-        _tmpColor.b *= 1.2 + node.activation * 1.3
+        _tmpColor.r *= 1.0 + node.activation * 1.0
+        _tmpColor.g *= 1.0 + node.activation * 1.0
+        _tmpColor.b *= 1.0 + node.activation * 1.0
         nodeMesh.setColorAt(i, _tmpColor)
 
         // Glow halo — barely extends past the core
@@ -522,9 +522,9 @@ export function Visualizer({
 
         <EffectComposer>
           <Bloom
-            intensity={1.2}
-            luminanceThreshold={0.2}
-            luminanceSmoothing={0.6}
+            intensity={0.8}
+            luminanceThreshold={0.4}
+            luminanceSmoothing={0.8}
             mipmapBlur
           />
         </EffectComposer>
