@@ -47,8 +47,7 @@ When you're ready, deploy your solution and send the URL + link to your submissi
 
 In your submission, please also include:
 - A title for your visualization
-- A short description of the work you built
-- Some of the design or implementation decisions you made along the way
+- A short description of the work you built, including some of the design or implementation decisions you made along the way
 
 We evaluate solutions on craft and novelty. You may use any AI tools that you like in this process.
 
