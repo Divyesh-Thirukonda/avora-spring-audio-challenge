@@ -17,6 +17,7 @@ export interface VisualizerProps {
 interface NodeData {
   position: THREE.Vector3
   velocity: THREE.Vector3
+  origin: THREE.Vector3
   freqBand: number
   activation: number
   baseSize: number
@@ -37,8 +38,9 @@ interface PacketData {
 
 const NODE_COUNT = 80
 const MAX_PACKETS = 300
-const BOUNDS = 15
-const SPREAD = 14
+// Extended bounds for the horizontal layout
+const BOUNDS_X = 18
+const BOUNDS_YZ = 8
 
 /* ─── Initialization ─── */
 
@@ -46,38 +48,48 @@ function createNodes(count: number): NodeData[] {
   const nodes: NodeData[] = []
 
   for (let i = 0; i < count; i++) {
+    // Distribute freqbands evenly 0-15
+    const freqBand = Math.floor((i / count) * 16)
+    
+    // Map frequency to position: Bass on the left, Treble on the right
+    const normalizedFreq = freqBand / 15 // 0.0 to 1.0
+    const x = (normalizedFreq - 0.5) * (BOUNDS_X * 2 * 0.8) + (Math.random() - 0.5) * 4
+    const y = (Math.random() - 0.5) * BOUNDS_YZ * 2
+    const z = (Math.random() - 0.5) * BOUNDS_YZ * 2
+
+    // Map frequency to hue: Bass = Red/Orange, Mids = Green, Treble = Blue/Purple
+    const hue = normalizedFreq * 300 + (Math.random() * 40 - 20)
+
     nodes.push({
-      position: new THREE.Vector3(
-        (Math.random() - 0.5) * SPREAD * 2,
-        (Math.random() - 0.5) * SPREAD * 2,
-        (Math.random() - 0.5) * SPREAD * 2,
-      ),
+      position: new THREE.Vector3(x, y, z),
       velocity: new THREE.Vector3(
-        (Math.random() - 0.5) * 0.012,
-        (Math.random() - 0.5) * 0.012,
-        (Math.random() - 0.5) * 0.012,
+        (Math.random() - 0.5) * 0.02,
+        (Math.random() - 0.5) * 0.02,
+        (Math.random() - 0.5) * 0.02,
       ),
-      freqBand: Math.floor(Math.random() * 16),
+      origin: new THREE.Vector3(x, y, z),
+      freqBand,
       activation: 0,
-      baseSize: 0.15 + Math.random() * 0.2,
-      hue: Math.random() * 360,
+      baseSize: 0.15 + Math.random() * 0.2, // slightly larger
+      hue: (hue + 360) % 360,
       connections: [],
       pulseTime: 0,
     })
   }
 
-  // Wire connections by proximity
-  const maxDist = SPREAD * 0.65
+  // Wire connections by proximity but favor connections within similar frequency bands
   for (let i = 0; i < count; i++) {
     const sorted: { idx: number; dist: number }[] = []
     for (let j = 0; j < count; j++) {
       if (i === j) continue
       const dist = nodes[i].position.distanceTo(nodes[j].position)
-      if (dist < maxDist) sorted.push({ idx: j, dist })
+      // Heavily penalize connecting to very distant frequency bands
+      const freqPenalty = Math.abs(nodes[i].freqBand - nodes[j].freqBand) * 1.5
+      sorted.push({ idx: j, dist: dist + freqPenalty })
     }
     sorted.sort((a, b) => a.dist - b.dist)
     nodes[i].connections = sorted
-      .slice(0, 3 + Math.floor(Math.random() * 3))
+      .slice(0, 3 + Math.floor(Math.random() * 3)) // 3-5 connections
       .map((s) => s.idx)
   }
 
@@ -88,8 +100,6 @@ function createNodes(count: number): NodeData[] {
 
 const _tmpColor = new THREE.Color()
 const _obj = new THREE.Object3D()
-const _boundsMin = new THREE.Vector3(-BOUNDS, -BOUNDS, -BOUNDS)
-const _boundsMax = new THREE.Vector3(BOUNDS, BOUNDS, BOUNDS)
 
 /* ─── NeuralScene ─── */
 
@@ -169,13 +179,14 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
     }
   }, [])
 
-  useFrame(() => {
+  useFrame(({ clock }) => {
     const nodes = nodesRef.current
     const packets = packetsRef.current
     if (!nodes.length) return
 
     const freqData = frequencyData.current
     const timeData = timeDomainData.current
+    const t = clock.elapsedTime
 
     // ── Audio analysis ──
     let waveAmp = 0
@@ -192,7 +203,11 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
       for (let i = 0; i < bandSize; i++) {
         sum += freqData[b * bandSize + i]
       }
-      bandEnergies[b] = sum / (bandSize * 255)
+      // Apply exponential frequency weighting: high frequencies naturally have
+      // exponentially less amplitude than bass, so we need a massive boost for treble
+      // b=0 (bass) multiplier is 1.0; b=15 (highest treble) multiplier is ~26.0
+      const energyMultiplier = 1 + Math.pow(b / 3, 2)
+      bandEnergies[b] = Math.min(1.0, (sum / (bandSize * 255)) * energyMultiplier)
     }
 
     const breathing = 1 + waveAmp * 0.5
@@ -203,20 +218,18 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
       const bandEnergy = bandEnergies[node.freqBand]
       node.activation += (bandEnergy - node.activation) * 0.15
 
-      // Derive a per-node "trigger" value from a neighboring freq bin
-      // instead of Math.random() — same audio = same trigger behavior
-      const neighborBin = ((node.freqBand + 3) % bandCount)
-      const triggerVal = (bandEnergies[neighborBin] * 7.3 + bandEnergy * 11.1) % 1
+      // Deterministic pseudo-random trigger based on time, node index, and audio
+      // This ensures consistent packet spawning that still looks organic
+      const timeHash = (Math.floor(t * 10) * 13.7 + i * 29.3) % 1
 
-      // Spawn packets on strong activation (deterministic)
-      if (node.activation > 0.4 && triggerVal < node.activation * 0.15) {
+      // Spawn packets on strong activation
+      if (node.activation > 0.3 && timeHash < node.activation * 0.3) {
         node.pulseTime = 1
         for (let ci = 0; ci < node.connections.length; ci++) {
           const connIdx = node.connections[ci]
-          // Use time-domain waveform at a node+connection-specific index
-          const tdIdx = (i * 7 + ci * 13) % timeData.length
-          const connTrigger = (timeData[tdIdx] / 255)
-          if (packets.length < MAX_PACKETS && connTrigger > 0.6) {
+          // Deterministic check per connection
+          const connHash = (timeHash * 43.1 + ci * 17.9) % 1
+          if (packets.length < MAX_PACKETS && connHash < 0.35) {
             // Speed derived from band energy — higher energy = faster packets
             const speedVal = bandEnergy * 0.025 + (1 - bandEnergy) * 0.015
             packets.push({
@@ -232,16 +245,26 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
 
       node.pulseTime *= 0.92
 
-      // Drift
-      node.position.add(node.velocity)
+      // Spring physics to hover around origin
+      const dx = node.origin.x - node.position.x
+      const dy = node.origin.y - node.position.y
+      const dz = node.origin.z - node.position.z
 
-      // Bounce
-      const p = node.position
-      const v = node.velocity
-      if (p.x < -BOUNDS || p.x > BOUNDS) v.x *= -1
-      if (p.y < -BOUNDS || p.y > BOUNDS) v.y *= -1
-      if (p.z < -BOUNDS || p.z > BOUNDS) v.z *= -1
-      p.clamp(_boundsMin, _boundsMax)
+      // Pull back to origin, stronger when far away
+      node.velocity.x += dx * 0.002
+      node.velocity.y += dy * 0.002
+      node.velocity.z += dz * 0.002
+
+      // Add a slight organic swirling force
+      node.velocity.x += Math.sin(t * 0.5 + i) * 0.001
+      node.velocity.y += Math.cos(t * 0.6 + i) * 0.001
+      node.velocity.z += Math.sin(t * 0.7 - i) * 0.001
+
+      // Dampen velocity to prevent infinite acceleration
+      node.velocity.multiplyScalar(0.95)
+
+      // Apply velocity
+      node.position.add(node.velocity)
     }
 
     // ── Update instanced node meshes ──
@@ -295,7 +318,7 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
           if (connIdx <= i) continue
           const other = nodes[connIdx]
           const dist = node.position.distanceTo(other.position)
-          if (dist > BOUNDS * 0.9) continue
+          if (dist > BOUNDS_X * 0.9) continue
 
           const act = (node.activation + other.activation) / 2
           const brightness = 0.2 + act * 0.8
