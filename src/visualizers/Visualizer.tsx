@@ -1,150 +1,221 @@
-import { useRef, useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import { EffectComposer, Bloom } from '@react-three/postprocessing'
 import * as THREE from 'three'
 
 export interface VisualizerProps {
-  frequencyData: React.RefObject<Uint8Array<ArrayBuffer>>
-  timeDomainData: React.RefObject<Uint8Array<ArrayBuffer>>
+  frequencyData: React.RefObject<Uint8Array>
+  timeDomainData: React.RefObject<Uint8Array>
   isActive: boolean
   width: number
   height: number
 }
 
-/* ─── Data structures ─── */
-
 interface NodeData {
+  index: number
+  gridX: number
+  home: THREE.Vector3
   position: THREE.Vector3
-  velocity: THREE.Vector3
-  origin: THREE.Vector3
-  freqBand: number
   activation: number
+  traffic: number
+  pulse: number
   baseSize: number
   hue: number
-  connections: number[]
-  pulseTime: number
+  freqBand: number
+  neighbors: number[]
+  edgeIds: number[]
+}
+
+interface EdgeData {
+  a: number
+  b: number
+  traffic: number
 }
 
 interface PacketData {
+  edgeIndex: number
   fromNode: number
   toNode: number
   progress: number
   speed: number
+  energy: number
   hue: number
-  energy: number   // 0-1, the band energy that spawned this packet (weight/significance)
-  size: number     // visual radius, derived from energy
 }
 
-/* ─── Constants ─── */
-
-const NODE_COUNT = 80
-const MAX_PACKETS = 300
-// Extended bounds for the horizontal layout
-const BOUNDS_X = 18
-const BOUNDS_YZ = 8
-
-/* ─── Initialization ─── */
-
-function createNodes(count: number): NodeData[] {
-  const nodes: NodeData[] = []
-
-  for (let i = 0; i < count; i++) {
-    // Distribute freqbands evenly 0-15
-    const freqBand = Math.floor((i / count) * 16)
-    
-    // Map frequency to position: Bass on the left, Treble on the right
-    const normalizedFreq = freqBand / 15 // 0.0 to 1.0
-    const x = (normalizedFreq - 0.5) * (BOUNDS_X * 2 * 0.8) + (Math.random() - 0.5) * 4
-    const y = (Math.random() - 0.5) * BOUNDS_YZ * 2
-    const z = (Math.random() - 0.5) * BOUNDS_YZ * 2
-
-    // Map frequency to hue: Bass = Red/Orange, Mids = Green, Treble = Blue/Purple
-    const hue = normalizedFreq * 300 + (Math.random() * 40 - 20)
-
-    nodes.push({
-      position: new THREE.Vector3(x, y, z),
-      velocity: new THREE.Vector3(
-        (Math.random() - 0.5) * 0.02,
-        (Math.random() - 0.5) * 0.02,
-        (Math.random() - 0.5) * 0.02,
-      ),
-      origin: new THREE.Vector3(x, y, z),
-      freqBand,
-      activation: 0,
-      baseSize: 0.15 + Math.random() * 0.2, // slightly larger
-      hue: (hue + 360) % 360,
-      connections: [],
-      pulseTime: 0,
-    })
-  }
-
-  // Wire connections by proximity but favor connections within similar frequency bands
-  for (let i = 0; i < count; i++) {
-    const sorted: { idx: number; dist: number }[] = []
-    for (let j = 0; j < count; j++) {
-      if (i === j) continue
-      const dist = nodes[i].position.distanceTo(nodes[j].position)
-      // Heavily penalize connecting to very distant frequency bands
-      const freqPenalty = Math.abs(nodes[i].freqBand - nodes[j].freqBand) * 1.5
-      sorted.push({ idx: j, dist: dist + freqPenalty })
-    }
-    sorted.sort((a, b) => a.dist - b.dist)
-    nodes[i].connections = sorted
-      .slice(0, 3 + Math.floor(Math.random() * 3)) // 3-5 connections
-      .map((s) => s.idx)
-  }
-
-  return nodes
+interface SceneProps {
+  frequencyData: React.RefObject<Uint8Array>
+  timeDomainData: React.RefObject<Uint8Array>
 }
 
-/* ─── Reusable temp objects ─── */
+const GRID_SIZE = 10
+const NODE_COUNT = GRID_SIZE * GRID_SIZE * GRID_SIZE
+const EDGE_COUNT = 3 * GRID_SIZE * GRID_SIZE * (GRID_SIZE - 1)
+const MAX_PACKETS = 220
+const NODE_SPACING = 1.25
+const CUBE_SPAN = (GRID_SIZE - 1) * NODE_SPACING
+const AXIS_LENGTH = CUBE_SPAN * 0.85 + 3.5
 
 const _tmpColor = new THREE.Color()
 const _obj = new THREE.Object3D()
+const _packetPos = new THREE.Vector3()
 
-/* ─── NeuralScene ─── */
-
-interface SceneProps {
-  frequencyData: React.RefObject<Uint8Array<ArrayBuffer>>
-  timeDomainData: React.RefObject<Uint8Array<ArrayBuffer>>
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value))
 }
 
-function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
-  const nodesRef = useRef<NodeData[]>([])
+function hash01(seed: number) {
+  const x = Math.sin(seed * 127.1 + 311.7) * 43758.5453123
+  return x - Math.floor(x)
+}
+
+function centeredCoord(value: number) {
+  return (value - (GRID_SIZE - 1) / 2) * NODE_SPACING
+}
+
+function nodeIndex(x: number, y: number, z: number) {
+  return x + y * GRID_SIZE + z * GRID_SIZE * GRID_SIZE
+}
+
+function createGraph() {
+  const nodes: NodeData[] = []
+  const edges: EdgeData[] = []
+
+  for (let z = 0; z < GRID_SIZE; z++) {
+    for (let y = 0; y < GRID_SIZE; y++) {
+      for (let x = 0; x < GRID_SIZE; x++) {
+        const index = nodeIndex(x, y, z)
+        const px = centeredCoord(x)
+        const py = centeredCoord(y)
+        const pz = centeredCoord(z)
+        const freqBand = Math.round((x / (GRID_SIZE - 1)) * 15)
+        const freqMix = x / (GRID_SIZE - 1)
+        const home = new THREE.Vector3(px, py, pz)
+
+        nodes.push({
+          index,
+          gridX: x,
+          home,
+          position: home.clone(),
+          activation: 0,
+          traffic: 0,
+          pulse: 0,
+          baseSize: 0.05 + hash01(index * 11 + 7) * 0.025,
+          hue: 0.56 + freqMix * 0.14,
+          freqBand,
+          neighbors: [],
+          edgeIds: [],
+        })
+      }
+    }
+  }
+
+  const addEdge = (a: number, b: number) => {
+    const edgeIndex = edges.length
+    edges.push({ a, b, traffic: 0 })
+    nodes[a].neighbors.push(b)
+    nodes[a].edgeIds.push(edgeIndex)
+    nodes[b].neighbors.push(a)
+    nodes[b].edgeIds.push(edgeIndex)
+  }
+
+  for (let z = 0; z < GRID_SIZE; z++) {
+    for (let y = 0; y < GRID_SIZE; y++) {
+      for (let x = 0; x < GRID_SIZE; x++) {
+        const current = nodeIndex(x, y, z)
+        if (x + 1 < GRID_SIZE) addEdge(current, nodeIndex(x + 1, y, z))
+        if (y + 1 < GRID_SIZE) addEdge(current, nodeIndex(x, y + 1, z))
+        if (z + 1 < GRID_SIZE) addEdge(current, nodeIndex(x, y, z + 1))
+      }
+    }
+  }
+
+  return { nodes, edges }
+}
+
+function sampleAudio(
+  frequencyData: Uint8Array,
+  timeDomainData: Uint8Array,
+  bandEnergies: Float32Array,
+) {
+  bandEnergies.fill(0)
+
+  if (!frequencyData.length || !timeDomainData.length) {
+    return { waveAmp: 0, activeBandAverage: 0 }
+  }
+
+  let waveAmp = 0
+  for (let i = 0; i < timeDomainData.length; i++) {
+    waveAmp += Math.abs(timeDomainData[i] - 128)
+  }
+  waveAmp /= timeDomainData.length * 128
+
+  const bandCount = bandEnergies.length
+  const bandSize = Math.max(1, Math.floor(frequencyData.length / bandCount))
+  let activeBandAverage = 0
+
+  for (let band = 0; band < bandCount; band++) {
+    let sum = 0
+    for (let i = 0; i < bandSize; i++) {
+      const sampleIndex = band * bandSize + i
+      if (sampleIndex >= frequencyData.length) break
+      sum += frequencyData[sampleIndex]
+    }
+    const weight = 1 + Math.pow(band / 3, 1.5)
+    const energy = clamp((sum / (bandSize * 255)) * weight, 0, 1)
+    bandEnergies[band] = energy
+    activeBandAverage += energy
+  }
+
+  return { waveAmp, activeBandAverage: activeBandAverage / bandEnergies.length }
+}
+
+function GraphScene({ frequencyData, timeDomainData }: SceneProps) {
+  const graph = useMemo(() => createGraph(), [])
+  const nodesRef = useRef<NodeData[]>(graph.nodes)
+  const edgesRef = useRef<EdgeData[]>(graph.edges)
   const packetsRef = useRef<PacketData[]>([])
 
-  // Instanced mesh refs
   const nodeMeshRef = useRef<THREE.InstancedMesh>(null)
   const glowMeshRef = useRef<THREE.InstancedMesh>(null)
   const packetMeshRef = useRef<THREE.InstancedMesh>(null)
-
-  // Line geometry ref
   const lineGeoRef = useRef<THREE.BufferGeometry>(null)
 
-  // Pre-allocate line buffers
-  const maxLineVerts = NODE_COUNT * 6 * 2
-  const linePositions = useMemo(() => new Float32Array(maxLineVerts * 3), [maxLineVerts])
-  const lineColors = useMemo(() => new Float32Array(maxLineVerts * 3), [maxLineVerts])
+  const bandEnergiesRef = useRef(new Float32Array(16))
+  const linePositionsRef = useRef(new Float32Array(EDGE_COUNT * 2 * 3))
+  const lineColorsRef = useRef(new Float32Array(EDGE_COUNT * 2 * 3))
+  const axesHelper = useMemo(() => new THREE.AxesHelper(AXIS_LENGTH), [])
+  const cubeFrameGeometry = useMemo(
+    () => new THREE.EdgesGeometry(new THREE.BoxGeometry(CUBE_SPAN, CUBE_SPAN, CUBE_SPAN)),
+    [],
+  )
 
-  // Initialize nodes + instance colors on mount
   useEffect(() => {
-    nodesRef.current = createNodes(NODE_COUNT)
-    packetsRef.current = []
-
-    // Force-initialize instanceColor buffers with bright base colors
+    const nodes = nodesRef.current
     const nodeMesh = nodeMeshRef.current
     const glowMesh = glowMeshRef.current
     const packetMesh = packetMeshRef.current
-    const nodes = nodesRef.current
+    const lineGeo = lineGeoRef.current
+    const linePositions = linePositionsRef.current
+    const lineColors = lineColorsRef.current
+
+    if (lineGeo) {
+      const positionAttr = new THREE.BufferAttribute(linePositions, 3)
+      const colorAttr = new THREE.BufferAttribute(lineColors, 3)
+      positionAttr.setUsage(THREE.DynamicDrawUsage)
+      colorAttr.setUsage(THREE.DynamicDrawUsage)
+      lineGeo.setAttribute('position', positionAttr)
+      lineGeo.setAttribute('color', colorAttr)
+      lineGeo.setDrawRange(0, 0)
+    }
 
     if (nodeMesh) {
       for (let i = 0; i < nodes.length; i++) {
-        _tmpColor.setHSL(nodes[i].hue / 360, 0.8, 0.6)
+        const node = nodes[i]
+        _tmpColor.setHSL(0, 0, 0.65)
         nodeMesh.setColorAt(i, _tmpColor)
-
-        _obj.position.copy(nodes[i].position)
-        _obj.scale.setScalar(nodes[i].baseSize)
+        _obj.position.copy(node.position)
+        _obj.scale.setScalar(node.baseSize)
         _obj.updateMatrix()
         nodeMesh.setMatrixAt(i, _obj.matrix)
       }
@@ -154,12 +225,12 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
 
     if (glowMesh) {
       for (let i = 0; i < nodes.length; i++) {
-        _tmpColor.setHSL(nodes[i].hue / 360, 0.9, 0.5)
-        _tmpColor.multiplyScalar(0.2)
+        const node = nodes[i]
+        _tmpColor.setHSL(0, 0, 0.4)
+        _tmpColor.multiplyScalar(0.1)
         glowMesh.setColorAt(i, _tmpColor)
-
-        _obj.position.copy(nodes[i].position)
-        _obj.scale.setScalar(nodes[i].baseSize * 4)
+        _obj.position.copy(node.position)
+        _obj.scale.setScalar(node.baseSize * 2.2)
         _obj.updateMatrix()
         glowMesh.setMatrixAt(i, _obj.matrix)
       }
@@ -173,263 +244,223 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
         _obj.scale.setScalar(0)
         _obj.updateMatrix()
         packetMesh.setMatrixAt(i, _obj.matrix)
-        _tmpColor.set(0, 0, 0)
-        packetMesh.setColorAt(i, _tmpColor)
       }
       packetMesh.instanceMatrix.needsUpdate = true
       if (packetMesh.instanceColor) packetMesh.instanceColor.needsUpdate = true
     }
   }, [])
 
-  useFrame(({ clock }) => {
+  useFrame((_, delta) => {
     const nodes = nodesRef.current
+    const edges = edgesRef.current
     const packets = packetsRef.current
-    if (!nodes.length) return
+    const nodeMesh = nodeMeshRef.current
+    const glowMesh = glowMeshRef.current
+    const packetMesh = packetMeshRef.current
+    const lineGeo = lineGeoRef.current
+    const bandEnergies = bandEnergiesRef.current
+    const linePositions = linePositionsRef.current
+    const lineColors = lineColorsRef.current
 
-    const freqData = frequencyData.current
-    const timeData = timeDomainData.current
-    const t = clock.elapsedTime
+    if (!nodeMesh || !glowMesh || !packetMesh || !lineGeo) return
 
-    // ── Audio analysis ──
-    let waveAmp = 0
-    for (let i = 0; i < timeData.length; i++) {
-      waveAmp += Math.abs(timeData[i] - 128)
-    }
-    waveAmp /= timeData.length * 128
+    const frameScale = Math.min(delta * 60, 1.5)
+    const decayNodeTraffic = Math.pow(0.965, frameScale)
+    const decayEdgeTraffic = Math.pow(0.972, frameScale)
+    const decayPulse = Math.pow(0.9, frameScale)
+    const { waveAmp, activeBandAverage } = sampleAudio(
+      frequencyData.current ?? new Uint8Array(0),
+      timeDomainData.current ?? new Uint8Array(0),
+      bandEnergies,
+    )
 
-    const bandCount = 16
-    const bandEnergies = new Float32Array(bandCount)
-    const bandSize = Math.floor(freqData.length / bandCount)
-    for (let b = 0; b < bandCount; b++) {
-      let sum = 0
-      for (let i = 0; i < bandSize; i++) {
-        sum += freqData[b * bandSize + i]
-      }
-      // Apply exponential frequency weighting: high frequencies naturally have
-      // exponentially less amplitude than bass, so we need a massive boost for treble
-      // b=0 (bass) multiplier is 1.0; b=15 (highest treble) multiplier is ~57.0
-      const energyMultiplier = 1 + Math.pow(b / 2, 2)
-      bandEnergies[b] = Math.min(1.0, (sum / (bandSize * 255)) * energyMultiplier)
-    }
-
-    const breathing = 1 + waveAmp * 0.5
-
-    // ── Update node physics ──
     for (let i = 0; i < nodes.length; i++) {
       const node = nodes[i]
-      const bandEnergy = bandEnergies[node.freqBand]
-      node.activation += (bandEnergy - node.activation) * 0.15
+      const bandEnergy = bandEnergies[node.freqBand] ?? 0
+      const targetActivation = clamp(
+        bandEnergy * 0.9 + node.traffic * 0.45 + waveAmp * 0.15,
+        0,
+        1.2,
+      )
+      node.activation += (targetActivation - node.activation) * (0.12 * frameScale)
+      node.traffic *= decayNodeTraffic
+      node.pulse *= decayPulse
+      node.position.copy(node.home)
+    }
 
-      // Deterministic pseudo-random trigger based on time, node index, and audio
-      // This ensures consistent packet spawning that still looks organic
-      const timeHash = (Math.floor(t * 10) * 13.7 + i * 29.3) % 1
+    for (let i = 0; i < edges.length; i++) {
+      edges[i].traffic *= decayEdgeTraffic
+    }
 
-      // Spawn packets on strong activation
-      if (node.activation > 0.3 && timeHash < node.activation * 0.3) {
-        node.pulseTime = 1
-        for (let ci = 0; ci < node.connections.length; ci++) {
-          const connIdx = node.connections[ci]
-          // Deterministic check per connection
-          const connHash = (timeHash * 43.1 + ci * 17.9) % 1
-          if (packets.length < MAX_PACKETS && connHash < 0.35) {
-            const energy = bandEnergy // packet's significance weight
+    const spawnChanceBase = (0.0015 + activeBandAverage * 0.012 + waveAmp * 0.004) * frameScale
+    for (let i = 0; i < nodes.length && packets.length < MAX_PACKETS; i++) {
+      const node = nodes[i]
+      if (node.activation < 0.2) continue
 
-            // Speed weighted by energy: quiet=0.008, loud=0.035
-            const speedVal = 0.008 + energy * 0.027
+      const spawnChance = spawnChanceBase + node.activation * 0.014 + node.traffic * 0.005
+      if (Math.random() >= spawnChance) continue
 
-            // Size weighted by energy: quiet=0.08, loud=0.30
-            const sizeVal = 0.08 + energy * 0.22
+      let totalWeight = 0
+      const weights = new Array(node.neighbors.length)
+      for (let j = 0; j < node.neighbors.length; j++) {
+        const neighborIndex = node.neighbors[j]
+        const edge = edges[node.edgeIds[j]]
+        const neighbor = nodes[neighborIndex]
+        const weight =
+          0.25 +
+          neighbor.activation * 1.2 +
+          neighbor.traffic * 0.8 +
+          edge.traffic * 1.5 +
+          (neighbor.gridX > node.gridX ? 0.08 : 0)
+        weights[j] = weight
+        totalWeight += weight
+      }
 
-            packets.push({
-              fromNode: i,
-              toNode: connIdx,
-              progress: 0,
-              speed: speedVal,
-              hue: node.hue,
-              energy,
-              size: sizeVal,
-            })
-          }
+      if (totalWeight <= 0) continue
+
+      let selection = Math.random() * totalWeight
+      let targetSlot = 0
+      for (let j = 0; j < weights.length; j++) {
+        selection -= weights[j]
+        if (selection <= 0) {
+          targetSlot = j
+          break
         }
       }
 
-      node.pulseTime *= 0.92
+      const edgeIndex = node.edgeIds[targetSlot]
+      const toNode = node.neighbors[targetSlot]
+      const edge = edges[edgeIndex]
+      const energy = clamp(node.activation * 0.8 + waveAmp * 0.5, 0.1, 1.15)
 
-      // Spring physics to hover around origin
-      const dx = node.origin.x - node.position.x
-      const dy = node.origin.y - node.position.y
-      const dz = node.origin.z - node.position.z
+      edge.traffic = clamp(edge.traffic + energy * 0.12, 0, 1.8)
+      node.traffic = clamp(node.traffic + energy * 0.08, 0, 1.4)
+      node.pulse = clamp(node.pulse + 0.25, 0, 1.4)
 
-      // Pull back to origin, stronger when far away
-      node.velocity.x += dx * 0.002
-      node.velocity.y += dy * 0.002
-      node.velocity.z += dz * 0.002
-
-      // Add a slight organic swirling force
-      node.velocity.x += Math.sin(t * 0.5 + i) * 0.001
-      node.velocity.y += Math.cos(t * 0.6 + i) * 0.001
-      node.velocity.z += Math.sin(t * 0.7 - i) * 0.001
-
-      // Dampen velocity to prevent infinite acceleration
-      node.velocity.multiplyScalar(0.95)
-
-      // Apply velocity
-      node.position.add(node.velocity)
+      packets.push({
+        edgeIndex,
+        fromNode: node.index,
+        toNode,
+        progress: 0,
+        speed: 0.018 + energy * 0.028,
+        energy,
+        hue: node.hue,
+      })
     }
 
-    // ── Update instanced node meshes ──
-    const nodeMesh = nodeMeshRef.current
-    const glowMesh = glowMeshRef.current
     if (nodeMesh && glowMesh) {
       for (let i = 0; i < nodes.length; i++) {
         const node = nodes[i]
-        const size = node.baseSize * breathing * (1 + node.activation * 1.5 + node.pulseTime * 1.2)
+        const activity = clamp(node.activation * 0.75 + node.traffic * 0.55 + node.pulse * 0.45, 0, 1.5)
+        const size = node.baseSize * (1 + waveAmp * 0.18 + activity * 0.72)
 
-        // Core sphere
         _obj.position.copy(node.position)
         _obj.scale.setScalar(size)
         _obj.updateMatrix()
         nodeMesh.setMatrixAt(i, _obj.matrix)
 
-        // Color: vibrant and bright via HDR
-        const L = 0.5 + node.activation * 0.35
-        _tmpColor.setHSL(node.hue / 360, 0.85, L)
-        _tmpColor.r *= 1.0 + node.activation * 1.0
-        _tmpColor.g *= 1.0 + node.activation * 1.0
-        _tmpColor.b *= 1.0 + node.activation * 1.0
+        _tmpColor.setHSL(0, 0, 0.5 + activity * 0.2)
+        _tmpColor.multiplyScalar(0.9 + activity * 0.55)
         nodeMesh.setColorAt(i, _tmpColor)
 
-        // Glow halo — barely extends past the core
-        const glowSize = size * (1.15 + node.activation * 0.15)
-        _obj.scale.setScalar(glowSize)
+        _obj.scale.setScalar(size * (1.35 + activity * 0.18))
         _obj.updateMatrix()
         glowMesh.setMatrixAt(i, _obj.matrix)
 
-        const gb = 0.04 + node.activation * 0.12
-        _tmpColor.setHSL(node.hue / 360, 0.7, 0.4 + node.activation * 0.2)
-        _tmpColor.r *= gb
-        _tmpColor.g *= gb
-        _tmpColor.b *= gb
+        _tmpColor.setHSL(0, 0, 0.3 + activity * 0.1)
+        _tmpColor.multiplyScalar(0.07 + activity * 0.12)
         glowMesh.setColorAt(i, _tmpColor)
       }
+
       nodeMesh.instanceMatrix.needsUpdate = true
-      nodeMesh.instanceColor!.needsUpdate = true
       glowMesh.instanceMatrix.needsUpdate = true
-      glowMesh.instanceColor!.needsUpdate = true
+      if (nodeMesh.instanceColor) nodeMesh.instanceColor.needsUpdate = true
+      if (glowMesh.instanceColor) glowMesh.instanceColor.needsUpdate = true
     }
 
-    // ── Update connection lines ──
-    const lineGeo = lineGeoRef.current
     if (lineGeo) {
-      let vi = 0
-      for (let i = 0; i < nodes.length; i++) {
-        const node = nodes[i]
-        for (const connIdx of node.connections) {
-          if (connIdx <= i) continue
-          const other = nodes[connIdx]
-          const dist = node.position.distanceTo(other.position)
-          if (dist > BOUNDS_X * 0.9) continue
+      let vertexIndex = 0
+      for (let i = 0; i < edges.length; i++) {
+        const edge = edges[i]
+        const a = nodes[edge.a]
+        const b = nodes[edge.b]
+        const score =
+          edge.traffic * 0.85 +
+          (a.activation + b.activation) * 0.22 +
+          (a.traffic + b.traffic) * 0.42
+        const brightness = clamp(0.08 + score * 0.58, 0.08, 0.95)
+        _tmpColor.setHSL(0, 0, 0.35 + brightness * 0.2)
+        _tmpColor.multiplyScalar(0.38 + brightness * 0.45)
 
-          const act = (node.activation + other.activation) / 2
-          const brightness = 0.2 + act * 0.8
+        linePositions[vertexIndex * 3] = a.position.x
+        linePositions[vertexIndex * 3 + 1] = a.position.y
+        linePositions[vertexIndex * 3 + 2] = a.position.z
+        lineColors[vertexIndex * 3] = _tmpColor.r
+        lineColors[vertexIndex * 3 + 1] = _tmpColor.g
+        lineColors[vertexIndex * 3 + 2] = _tmpColor.b
+        vertexIndex++
 
-          // vertex 1
-          linePositions[vi * 3] = node.position.x
-          linePositions[vi * 3 + 1] = node.position.y
-          linePositions[vi * 3 + 2] = node.position.z
-          _tmpColor.setHSL((node.hue + other.hue) / 720, 0.6, 0.35 + act * 0.35)
-          _tmpColor.r *= brightness
-          _tmpColor.g *= brightness
-          _tmpColor.b *= brightness
-          lineColors[vi * 3] = _tmpColor.r
-          lineColors[vi * 3 + 1] = _tmpColor.g
-          lineColors[vi * 3 + 2] = _tmpColor.b
-          vi++
-
-          // vertex 2
-          linePositions[vi * 3] = other.position.x
-          linePositions[vi * 3 + 1] = other.position.y
-          linePositions[vi * 3 + 2] = other.position.z
-          lineColors[vi * 3] = _tmpColor.r
-          lineColors[vi * 3 + 1] = _tmpColor.g
-          lineColors[vi * 3 + 2] = _tmpColor.b
-          vi++
-        }
+        linePositions[vertexIndex * 3] = b.position.x
+        linePositions[vertexIndex * 3 + 1] = b.position.y
+        linePositions[vertexIndex * 3 + 2] = b.position.z
+        lineColors[vertexIndex * 3] = _tmpColor.r
+        lineColors[vertexIndex * 3 + 1] = _tmpColor.g
+        lineColors[vertexIndex * 3 + 2] = _tmpColor.b
+        vertexIndex++
       }
-      // Zero out unused
-      for (let i = vi * 3; i < linePositions.length; i++) {
+
+      for (let i = vertexIndex * 3; i < linePositions.length; i++) {
         linePositions[i] = 0
         lineColors[i] = 0
       }
 
-      const posAttr = lineGeo.getAttribute('position') as THREE.BufferAttribute | null
-      if (!posAttr) {
-        lineGeo.setAttribute('position', new THREE.BufferAttribute(linePositions, 3))
-        lineGeo.setAttribute('color', new THREE.BufferAttribute(lineColors, 3))
-      } else {
-        posAttr.set(linePositions)
-        posAttr.needsUpdate = true
-        const colAttr = lineGeo.getAttribute('color') as THREE.BufferAttribute
-        colAttr.set(lineColors)
-        colAttr.needsUpdate = true
-      }
-      lineGeo.setDrawRange(0, vi)
+      const positionAttr = lineGeo.getAttribute('position') as THREE.BufferAttribute
+      const colorAttr = lineGeo.getAttribute('color') as THREE.BufferAttribute
+      positionAttr.needsUpdate = true
+      colorAttr.needsUpdate = true
+      lineGeo.setDrawRange(0, vertexIndex)
     }
 
-    // ── Update packets ──
-    const packetMesh = packetMeshRef.current
     if (packetMesh) {
-      let activeCount = 0
+      let activePackets = 0
 
       for (let i = packets.length - 1; i >= 0; i--) {
-        const pkt = packets[i]
-        pkt.progress += pkt.speed
+        const packet = packets[i]
+        const edge = edges[packet.edgeIndex]
+        packet.progress += packet.speed * frameScale
+        edge.traffic = clamp(edge.traffic + packet.energy * 0.006 * frameScale, 0, 1.8)
 
-        if (pkt.progress >= 1) {
-          const dest = nodes[pkt.toNode]
-          // Impact on destination node is weighted by the packet's energy
-          const impactActivation = 0.05 + pkt.energy * 0.25  // 0.05 to 0.30
-          const impactPulse = 0.1 + pkt.energy * 0.5          // 0.1 to 0.6
-          dest.activation = Math.min(1, dest.activation + impactActivation)
-          dest.pulseTime = Math.min(1, dest.pulseTime + impactPulse)
+        if (packet.progress >= 1) {
+          const destination = nodes[packet.toNode]
+          destination.activation = clamp(destination.activation + 0.12 + packet.energy * 0.18, 0, 1.4)
+          destination.traffic = clamp(destination.traffic + 0.16 + packet.energy * 0.2, 0, 1.5)
+          destination.pulse = clamp(destination.pulse + 0.35, 0, 1.5)
           packets.splice(i, 1)
           continue
         }
 
-        const from = nodes[pkt.fromNode]
-        const to = nodes[pkt.toNode]
-        const t = pkt.progress
-        _obj.position.set(
-          from.position.x + (to.position.x - from.position.x) * t,
-          from.position.y + (to.position.y - from.position.y) * t,
-          from.position.z + (to.position.z - from.position.z) * t,
-        )
-        // Size uses the energy-weighted base size with a sine bulge in the middle of travel
-        _obj.scale.setScalar(pkt.size + Math.sin(t * Math.PI) * pkt.size * 0.5)
+        const from = nodes[packet.fromNode]
+        const to = nodes[packet.toNode]
+        _packetPos.lerpVectors(from.position, to.position, packet.progress)
+        _obj.position.copy(_packetPos)
+        _obj.scale.setScalar(0.045 + packet.energy * 0.085 + Math.sin(packet.progress * Math.PI) * 0.03)
         _obj.updateMatrix()
-        packetMesh.setMatrixAt(activeCount, _obj.matrix)
+        packetMesh.setMatrixAt(activePackets, _obj.matrix)
 
-        // Packet brightness weighted by energy: dim packets for quiet, blazing for loud
-        const pktLightness = 0.45 + pkt.energy * 0.35            // 0.45 to 0.80
-        const pktMultiplier = 0.8 + pkt.energy * 1.2              // 0.8 to 2.0
-        _tmpColor.setHSL(pkt.hue / 360, 0.9, pktLightness)
-        _tmpColor.r *= pktMultiplier
-        _tmpColor.g *= pktMultiplier
-        _tmpColor.b *= pktMultiplier
-        packetMesh.setColorAt(activeCount, _tmpColor)
-
-        activeCount++
+        _tmpColor.setHSL(0, 0, 0.7 + packet.energy * 0.2)
+        _tmpColor.multiplyScalar(1.2 + packet.energy * 0.7)
+        packetMesh.setColorAt(activePackets, _tmpColor)
+        activePackets++
       }
 
-      // Hide unused
-      for (let i = activeCount; i < MAX_PACKETS; i++) {
+      for (let i = activePackets; i < MAX_PACKETS; i++) {
         _obj.position.set(0, 0, 0)
         _obj.scale.setScalar(0)
         _obj.updateMatrix()
         packetMesh.setMatrixAt(i, _obj.matrix)
       }
 
-      packetMesh.count = Math.max(activeCount, 1)
+      packetMesh.count = Math.max(activePackets, 1)
       packetMesh.instanceMatrix.needsUpdate = true
       if (packetMesh.instanceColor) packetMesh.instanceColor.needsUpdate = true
     }
@@ -437,46 +468,54 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
 
   return (
     <>
-      {/* ── Connections ── */}
+      <primitive object={axesHelper} />
+
+      <lineSegments geometry={cubeFrameGeometry}>
+        <lineBasicMaterial
+          color="#cbd5e1"
+          transparent
+          opacity={0.3}
+          depthWrite={false}
+          toneMapped={false}
+        />
+      </lineSegments>
+
       <lineSegments frustumCulled={false}>
         <bufferGeometry ref={lineGeoRef} />
         <lineBasicMaterial
           vertexColors
           transparent
-          opacity={1}
+          opacity={0.42}
           depthWrite={false}
           blending={THREE.AdditiveBlending}
           toneMapped={false}
         />
       </lineSegments>
 
-      {/* ── Node cores ── */}
       <instancedMesh
         ref={nodeMeshRef}
         args={[undefined, undefined, NODE_COUNT]}
         frustumCulled={false}
       >
-        <sphereGeometry args={[1, 16, 12]} />
+        <sphereGeometry args={[1, 10, 8]} />
         <meshBasicMaterial toneMapped={false} />
       </instancedMesh>
 
-      {/* ── Glow halos ── */}
       <instancedMesh
         ref={glowMeshRef}
         args={[undefined, undefined, NODE_COUNT]}
         frustumCulled={false}
       >
-        <sphereGeometry args={[1, 10, 8]} />
+        <sphereGeometry args={[1, 8, 6]} />
         <meshBasicMaterial
           transparent
-          opacity={0.1}
+          opacity={0.12}
           depthWrite={false}
           blending={THREE.AdditiveBlending}
           toneMapped={false}
         />
       </instancedMesh>
 
-      {/* ── Packets ── */}
       <instancedMesh
         ref={packetMeshRef}
         args={[undefined, undefined, MAX_PACKETS]}
@@ -489,8 +528,6 @@ function NeuralScene({ frequencyData, timeDomainData }: SceneProps) {
   )
 }
 
-/* ─── Visualizer ─── */
-
 export function Visualizer({
   frequencyData,
   timeDomainData,
@@ -499,9 +536,9 @@ export function Visualizer({
   height,
 }: VisualizerProps) {
   return (
-    <div style={{ width, height, position: 'relative', background: '#030108' }}>
+    <div style={{ width, height, position: 'relative', background: '#05070c' }}>
       <Canvas
-        camera={{ position: [0, 0, 30], fov: 60, near: 0.1, far: 200 }}
+        camera={{ position: [15, 13, 18], fov: 42, near: 0.1, far: 120 }}
         gl={{
           antialias: true,
           alpha: false,
@@ -513,24 +550,24 @@ export function Visualizer({
         }}
         style={{ width: '100%', height: '100%' }}
       >
-        <color attach="background" args={['#030108']} />
+        <color attach="background" args={['#05070c']} />
 
-        <ambientLight intensity={0.1} />
-        <pointLight position={[20, 20, 20]} intensity={0.4} color="#6366f1" />
-        <pointLight position={[-20, -10, -15]} intensity={0.3} color="#ec4899" />
+        <ambientLight intensity={0.2} />
+        <pointLight position={[14, 16, 14]} intensity={0.36} color="#ffffff" />
+        <pointLight position={[-14, -8, 10]} intensity={0.14} color="#a3a3a3" />
 
         <OrbitControls
           enableDamping
-          dampingFactor={0.05}
+          dampingFactor={0.06}
           autoRotate
-          autoRotateSpeed={0.4}
-          minDistance={8}
-          maxDistance={80}
-          enablePan
+          autoRotateSpeed={0.12}
+          minDistance={14}
+          maxDistance={38}
+          enablePan={false}
         />
 
         {isActive && (
-          <NeuralScene
+          <GraphScene
             frequencyData={frequencyData}
             timeDomainData={timeDomainData}
           />
@@ -538,9 +575,9 @@ export function Visualizer({
 
         <EffectComposer>
           <Bloom
-            intensity={0.8}
-            luminanceThreshold={0.4}
-            luminanceSmoothing={0.8}
+            intensity={0.42}
+            luminanceThreshold={0.22}
+            luminanceSmoothing={0.7}
             mipmapBlur
           />
         </EffectComposer>
@@ -557,8 +594,8 @@ export function Visualizer({
             pointerEvents: 'none',
           }}
         >
-          <span style={{ fontFamily: 'monospace', fontSize: 12, color: '#a3a3a3' }}>
-            {'> awaiting microphone input...'}
+          <span style={{ fontFamily: 'monospace', fontSize: 12, color: '#94a3b8' }}>
+            awaiting microphone input
           </span>
         </div>
       )}

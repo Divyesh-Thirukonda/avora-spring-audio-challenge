@@ -1,11 +1,8 @@
-import { useEffect, useState, useMemo, useCallback } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAudio } from './audio/useAudio'
 import { Visualizer } from './visualizers/Visualizer'
 import './App.css'
 
-/**
- * Background color for the visualizer page.
- */
 const BACKGROUND_COLOR = '#000'
 
 function App() {

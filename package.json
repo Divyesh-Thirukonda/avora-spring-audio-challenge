@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "analyze:captures": "node scripts/analyze-captures.mjs --json",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"
