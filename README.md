@@ -1,5 +1,7 @@
 # Avora Spring Audio Challenge 2026
 
+**Live Deployment:** [https://avora-spring-audio-challenge.vercel.app](https://avora-spring-audio-challenge.vercel.app)
+
 Create your own novel audio visualization using real-time microphone input.
 
 ## Quick Start
