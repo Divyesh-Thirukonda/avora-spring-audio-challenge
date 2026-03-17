@@ -642,9 +642,9 @@ function GraphScene({ frequencyData, timeDomainData }: SceneProps) {
       // Combined: onset drives it, y/z shape it, energy gates it
       const targetActivation = clamp(
         (xActivation + bandWarmth) *
-        (0.25 + 0.75 * yActivation) *
-        (0.25 + 0.75 * zActivation) *
-        (0.3 + energy * 0.7),
+        (0.6 + 0.4 * yActivation) *
+        (0.6 + 0.4 * zActivation) *
+        (0.5 + energy * 0.8),
         0, 1.4,
       )
 
@@ -732,13 +732,14 @@ function GraphScene({ frequencyData, timeDomainData }: SceneProps) {
         const toNode = node.neighbors[targetSlot]
         const edge = edges[edgeIndex]
 
-        // Speed: driven by stream-normalized centroid
-        const packetSpeed = 0.008 + centroid * 0.032
+        // Speed: driven by pitch (centroid), rate of freq change (flux), and transients (attackSlope)
+        // This makes packets zip extremely fast during complex, rapidly changing audio
+        const packetSpeed = clamp(0.024 + centroid * 0.04 + flux * 0.15 + attackSlope * 0.12, 0.024, 0.3)
 
-        // Energy: how extreme the onset was (z-score)
+        // Energy: incorporates overall "super loud" peaks (crest) and transients (attackSlope/onsetZ)
         const packetEnergy = clamp(
-          (onsetZ / 3) * node.activation * (0.6 + crest * 0.4),
-          0.05, 1.2,
+          (onsetZ / 3) * node.activation * (0.6 + crest * 0.6) + (attackSlope * 0.4),
+          0.05, 1.8,
         )
 
         edge.traffic = clamp(edge.traffic + packetEnergy * 0.12, 0, 1.8)
@@ -774,12 +775,16 @@ function GraphScene({ frequencyData, timeDomainData }: SceneProps) {
         _tmpColor.multiplyScalar(0.9 + activity * 0.55)
         nodeMesh.setColorAt(i, _tmpColor)
 
-        _obj.scale.setScalar(size * (1.3 + activity * 0.2))
+        // Glow scale explodes when the audio is "super loud" (energy) or rapidly changing (flux)
+        const dynamicGlow = 1.3 + activity * (0.2 + energy * 1.5 + flux * 1.0)
+        _obj.scale.setScalar(size * dynamicGlow)
         _obj.updateMatrix()
         glowMesh.setMatrixAt(i, _obj.matrix)
 
-        _tmpColor.setHSL(0, 0, 0.25 + activity * 0.15)
-        _tmpColor.multiplyScalar(0.06 + activity * 0.14)
+        // Color blasts to pure brilliant white during sharp attacks and loud peaks
+        const flash = activity * (1.0 + attackSlope * 1.5 + crest * 0.5)
+        _tmpColor.setHSL(0, 0, clamp(0.25 + flash * 0.6, 0, 1))
+        _tmpColor.multiplyScalar(0.06 + flash * 0.8)
         glowMesh.setColorAt(i, _tmpColor)
       }
 
@@ -843,9 +848,9 @@ function GraphScene({ frequencyData, timeDomainData }: SceneProps) {
 
         if (packet.progress >= 1) {
           const destination = nodes[packet.toNode]
-          destination.activation = clamp(destination.activation + packet.energy * 0.18, 0, 1.4)
-          destination.traffic = clamp(destination.traffic + packet.energy * 0.22, 0, 1.5)
-          destination.pulse = clamp(destination.pulse + packet.energy * crest * 0.4, 0, 1.5)
+          destination.activation = clamp(destination.activation + packet.energy * 0.45, 0, 1.4)
+          destination.traffic = clamp(destination.traffic + packet.energy * 0.35, 0, 1.5)
+          destination.pulse = clamp(destination.pulse + packet.energy * crest * 0.5, 0, 1.5)
           packets.splice(i, 1)
           continue
         }
